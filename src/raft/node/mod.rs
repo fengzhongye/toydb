@@ -2,8 +2,8 @@ mod candidate;
 mod follower;
 mod leader;
 
-use super::{Address, Driver, Event, Index, Instruction, Log, Message, State};
-use crate::error::Result;
+use super::{Address, Event, Index, Log, Message, State};
+use crate::error::{Error, Result};
 use candidate::Candidate;
 use follower::Follower;
 use leader::Leader;
@@ -68,16 +68,11 @@ impl Node {
     pub async fn new(
         id: NodeID,
         peers: HashSet<NodeID>,
-        mut log: Log,
-        mut state: Box<dyn State>,
+        log: Log,
+        state: Box<dyn State>,
         node_tx: mpsc::UnboundedSender<Message>,
     ) -> Result<Self> {
-        let (state_tx, state_rx) = mpsc::unbounded_channel();
-        let mut driver = Driver::new(id, state_rx, node_tx.clone());
-        driver.apply_log(&mut *state, &mut log)?;
-        tokio::spawn(driver.drive(state));
-
-        let node = RawNode::new(id, peers, log, node_tx, state_tx)?;
+        let node = RawNode::new(id, peers, log, state, node_tx)?;
         if node.peers.is_empty() {
             // If there are no peers, become leader immediately.
             return Ok(node.into_candidate()?.into_leader()?.into());
@@ -144,8 +139,8 @@ pub struct RawNode<R: Role = Follower> {
     peers: HashSet<NodeID>,
     term: Term,
     log: Log,
+    state: Box<dyn State>,
     node_tx: mpsc::UnboundedSender<Message>,
-    state_tx: mpsc::UnboundedSender<Instruction>,
     role: R,
 }
 
@@ -157,10 +152,40 @@ impl<R: Role> RawNode<R> {
             peers: self.peers,
             term: self.term,
             log: self.log,
+            state: self.state,
             node_tx: self.node_tx,
-            state_tx: self.state_tx,
             role,
         }
+    }
+
+    /// Applies any pending, committed entries to the state machine.
+    fn maybe_apply(&mut self) -> Result<()> {
+        Self::maybe_apply_with(&mut self.log, &mut self.state, |_, _| Ok(()))
+    }
+
+    /// Like maybe_apply(), but calls the given closure with the result of every
+    /// applied command. Not a method, so that the closure can mutate the node.
+    fn maybe_apply_with<F>(log: &mut Log, state: &mut Box<dyn State>, mut on_apply: F) -> Result<()>
+    where
+        F: FnMut(Index, Result<Vec<u8>>) -> Result<()>,
+    {
+        let applied_index = state.get_applied_index();
+        let commit_index = log.get_commit_index().0;
+        assert!(commit_index >= applied_index, "Commit index below applied index");
+        if applied_index >= commit_index {
+            return Ok(());
+        }
+
+        let mut scan = log.scan((applied_index + 1)..=commit_index)?;
+        while let Some(entry) = scan.next().transpose()? {
+            let index = entry.index;
+            debug!("Applying {:?}", entry);
+            match state.apply(entry) {
+                Err(error @ Error::Internal(_)) => return Err(error),
+                result => on_apply(index, result)?,
+            }
+        }
+        Ok(())
     }
 
     /// Returns the size of the cluster.
@@ -247,7 +272,6 @@ fn quorum_value<T: Ord + Copy>(mut values: Vec<T>) -> T {
 mod tests {
     pub use super::super::state::tests::TestState;
     use super::super::{Entry, RequestID};
-    use super::follower::tests::{follower_leader, follower_voted_for};
     use super::*;
     use crate::storage;
     use pretty_assertions::assert_eq;
@@ -282,8 +306,21 @@ mod tests {
             }
         }
 
+        fn state(&mut self) -> &'_ mut Box<dyn State> {
+            match self.node {
+                Node::Candidate(n) => &mut n.state,
+                Node::Follower(n) => &mut n.state,
+                Node::Leader(n) => &mut n.state,
+            }
+        }
+
         pub fn committed(mut self, index: Index) -> Self {
             assert_eq!(index, self.log().get_commit_index().0, "Unexpected committed index");
+            self
+        }
+
+        pub fn applied(mut self, index: Index) -> Self {
+            assert_eq!(index, self.state().get_applied_index(), "Unexpected applied index");
             self
         }
 
@@ -335,7 +372,7 @@ mod tests {
                 leader,
                 match self.node {
                     Node::Candidate(_) => None,
-                    Node::Follower(n) => follower_leader(n),
+                    Node::Follower(n) => n.role.leader,
                     Node::Leader(_) => None,
                 },
                 "Unexpected leader",
@@ -371,7 +408,7 @@ mod tests {
                 saved_voted_for,
                 match self.node {
                     Node::Candidate(n) => Some(n.id),
-                    Node::Follower(n) => follower_voted_for(n),
+                    Node::Follower(n) => n.role.voted_for,
                     Node::Leader(n) => Some(n.id),
                 },
                 "Incorrect voted_for stored in log"
@@ -384,7 +421,7 @@ mod tests {
                 voted_for,
                 match self.node {
                     Node::Candidate(_) => None,
-                    Node::Follower(n) => follower_voted_for(n),
+                    Node::Follower(n) => n.role.voted_for,
                     Node::Leader(_) => None,
                 },
                 "Unexpected voted_for"
@@ -407,15 +444,14 @@ mod tests {
         peers: Vec<NodeID>,
     ) -> Result<(RawNode<Follower>, mpsc::UnboundedReceiver<Message>)> {
         let (node_tx, node_rx) = mpsc::unbounded_channel();
-        let (state_tx, _) = mpsc::unbounded_channel();
         let node = RawNode {
             role: Follower::new(None, None),
             id: 1,
             peers: HashSet::from_iter(peers),
             term: 1,
             log: Log::new(storage::engine::Memory::new(), false)?,
+            state: Box::new(TestState::new(0)),
             node_tx,
-            state_tx,
         };
         Ok((node, node_rx))
     }
@@ -440,57 +476,6 @@ mod tests {
             _ => panic!("Expected node to start as follower"),
         }
         Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn new_state_apply_all() -> Result<()> {
-        let (node_tx, _) = mpsc::unbounded_channel();
-        let mut log = Log::new(storage::engine::Memory::new(), false)?;
-        log.append(1, Some(vec![0x01]))?;
-        log.append(2, None)?;
-        log.append(2, Some(vec![0x02]))?;
-        log.commit(3)?;
-        log.append(2, Some(vec![0x03]))?;
-        let state = Box::new(TestState::new(0));
-
-        Node::new(1, HashSet::from([2, 3]), log, state.clone(), node_tx).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(state.list(), vec![vec![0x01], vec![0x02]]);
-        assert_eq!(state.get_applied_index(), 3);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn new_state_apply_partial() -> Result<()> {
-        let (node_tx, _) = mpsc::unbounded_channel();
-        let mut log = Log::new(storage::engine::Memory::new(), false)?;
-        log.append(1, Some(vec![0x01]))?;
-        log.append(2, None)?;
-        log.append(2, Some(vec![0x02]))?;
-        log.commit(3)?;
-        log.append(2, Some(vec![0x03]))?;
-        let state = Box::new(TestState::new(2));
-
-        Node::new(1, HashSet::from([2, 3]), log, state.clone(), node_tx).await?;
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(state.list(), vec![vec![0x02]]);
-        assert_eq!(state.get_applied_index(), 3);
-        Ok(())
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[should_panic(expected = "applied index above commit index")]
-    async fn new_state_apply_missing() {
-        let (node_tx, _) = mpsc::unbounded_channel();
-        let mut log = Log::new(storage::engine::Memory::new(), false).unwrap();
-        log.append(1, Some(vec![0x01])).unwrap();
-        log.append(2, None).unwrap();
-        log.append(2, Some(vec![0x02])).unwrap();
-        log.commit(3).unwrap();
-        log.append(2, Some(vec![0x03])).unwrap();
-        let state = Box::new(TestState::new(4));
-
-        Node::new(1, HashSet::from([2, 3]), log, state.clone(), node_tx).await.unwrap();
     }
 
     #[tokio::test]
